@@ -662,6 +662,12 @@ static void build_answer(lv_obj_t *face, int ring_in)
     int spk_x = -s_w / 2 + 8 + spk_r, spk_y = -s_h / 2 + 8 + spk_r;
     if (muse_board->round) {
         spk_y = -ring_in * 5 / 8;
+        /* A ring smaller than the Watcher's (the ESP-VoCat's 360 px) brings the
+         * button up beside the state line's longer words: drop it below them. */
+        int state_bottom = 40 + s_dy + lv_font_get_line_height(&lv_font_unscii_16) - s_h / 2;
+        if (!s_small && ring_in < 196 && spk_y - SPEAKER_PX / 2 < state_bottom + 2) {
+            spk_y = state_bottom + 2 + SPEAKER_PX / 2;
+        }
         int d = ring_in - spk_r - 4;   /* just inside the ring, even when swollen */
         spk_x = -(int)sqrtf((float)(d * d - spk_y * spk_y));
     }

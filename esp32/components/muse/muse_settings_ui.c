@@ -1228,8 +1228,12 @@ static void build_power_page(lv_obj_t *tile)
     button(list, LV_SYMBOL_POWER "  Power off", COLOR_DANGER, on_power_off, NULL);
     button(list, "Cancel", COLOR_TEXT, on_back, NULL);
     char text[128];
-    snprintf(text, sizeof(text), "Press the %s button to turn it back on. To just turn the screen off, press the %s button.",
-             muse_board->talk_button, muse_board->aux_button);
+    int n = snprintf(text, sizeof(text), "Press the %s button to turn it back on.", muse_board->talk_button);
+    /* Boards without an aux button (BOX-3, CoreS3, ESP-VoCat) sleep on a timer. */
+    if (muse_board->aux_button && n > 0 && n < (int)sizeof(text)) {
+        snprintf(text + n, sizeof(text) - n, " To just turn the screen off, press the %s button.",
+                 muse_board->aux_button);
+    }
     note(list, text);
 }
 

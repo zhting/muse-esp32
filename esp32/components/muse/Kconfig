@@ -70,6 +70,10 @@ menu "Muse"
         config MUSE_BOARD_M5STACK_CORES3
             bool "M5Stack CoreS3 (ESP32-S3, 320x240 touch LCD, speaker and microphones)"
             depends on IDF_TARGET_ESP32S3
+
+        config MUSE_BOARD_ESPRESSIF_VOCAT
+            bool "Espressif ESP-VoCat / EchoEar (ESP32-S3, round 360 px touch LCD, speaker and microphones)"
+            depends on IDF_TARGET_ESP32S3
     endchoice
 
     config MUSE_ENABLED
@@ -91,6 +95,7 @@ menu "Muse"
         default "m5stack_cardputer_adv" if MUSE_BOARD_M5STACK_CARDPUTER_ADV
         default "m5stack_stopwatch" if MUSE_BOARD_M5STACK_STOPWATCH
         default "m5stack_cores3" if MUSE_BOARD_M5STACK_CORES3
+        default "espressif_vocat" if MUSE_BOARD_ESPRESSIF_VOCAT
         default "none"
 
     # The Muse tools' serial port: the console UART behind the board's USB
@@ -105,6 +110,45 @@ menu "Muse"
         int "Speaker volume until one is chosen in settings (percent)"
         range 0 100
         default 70
+
+    choice MUSE_VOCAT_REV
+        prompt "ESP-VoCat board revision"
+        depends on MUSE_BOARD_ESPRESSIF_VOCAT
+        default MUSE_VOCAT_REV_AUTO
+        help
+            The revision is printed on the main board. v1.2 moved the
+            microphone input, amplifier enable and panel reset pins and added
+            a switch for the codecs' power. Detect at boot tells them apart by
+            whether the speaker codec answers with that switch off.
+
+        config MUSE_VOCAT_REV_AUTO
+            bool "Detect at boot"
+
+        config MUSE_VOCAT_REV_1_2
+            bool "v1.2 (ESP32-S3-WROOM-1, 16 MB flash)"
+
+        config MUSE_VOCAT_REV_1_0
+            bool "v1.0 (ESP32-S3-WROOM-2, 32 MB flash)"
+    endchoice
+
+    config MUSE_VOCAT_HEAD_TALK
+        bool "ESP-VoCat: touch the head to talk"
+        depends on MUSE_BOARD_ESPRESSIF_VOCAT
+        default y
+        help
+            Holding a hand on the touch strip on top of the head talks, as the
+            BOOT button does. Turn it off if it triggers by itself.
+
+    config MUSE_VOCAT_HEAD_THRESHOLD
+        int "ESP-VoCat: head touch threshold (tenths of a percent)"
+        depends on MUSE_VOCAT_HEAD_TALK
+        range 3 200
+        default 15
+        help
+            How far a touch pad's reading has to rise above its untouched
+            level to count as a touch. Raise it if the head talks on its own;
+            lower it if a hand on the head isn't noticed. 15 is 1.5%, the
+            level Espressif's ESP-VoCat board support uses.
 
     config MUSE_WATCHER_CAMERA
         bool "SenseCAP Watcher camera capture and live preview"
