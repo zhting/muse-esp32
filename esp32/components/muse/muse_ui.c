@@ -78,6 +78,19 @@ static const char *TAG = "muse_ui";
 #define FONT_COMPACT (&lv_font_montserrat_14)
 #endif
 
+extern const lv_font_t muse_font_chinese_16;
+static lv_font_t s_font_unscii_16_cjk;
+static bool s_font_cjk_inited;
+
+static void init_cjk_font(void)
+{
+    if (!s_font_cjk_inited) {
+        s_font_unscii_16_cjk = lv_font_unscii_16;
+        s_font_unscii_16_cjk.fallback = &muse_font_chinese_16;
+        s_font_cjk_inited = true;
+    }
+}
+
 /*
  * Two layouts: the full one (round 466 px or similar) with a progress ring,
  * level meter and settings tile, and a compact one for tiny screens (128 px)
@@ -671,7 +684,8 @@ static void build_answer(lv_obj_t *face, int ring_in)
         int d = ring_in - spk_r - 4;   /* just inside the ring, even when swollen */
         spk_x = -(int)sqrtf((float)(d * d - spk_y * spk_y));
     }
-    const lv_font_t *font = &lv_font_unscii_16;
+    init_cjk_font();
+    const lv_font_t *font = &s_font_unscii_16_cjk;
     int cw = lv_font_get_glyph_width(font, 'M', ' ');
     int pitch = lv_font_get_line_height(font) + CAPTION_LINE_SPACE;
 
@@ -776,6 +790,7 @@ static void on_ring_draw(lv_event_t *e)
 
 static void build_screen(void)
 {
+    init_cjk_font();
     lv_obj_t *scr = lv_screen_active();
     lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
@@ -860,7 +875,7 @@ static void build_screen(void)
 
     /* The compact layout leaves the state to the avatar and the caption,
      * unless the screen is tall enough to fit it in small type above Muse. */
-    s_state_lbl = make_label(face, s_small ? &lv_font_unscii_8 : &lv_font_unscii_16, 0xffffff);
+    s_state_lbl = make_label(face, s_small ? &lv_font_unscii_8 : &s_font_unscii_16_cjk, 0xffffff);
     lv_obj_set_style_text_letter_space(s_state_lbl, s_small ? 1 : 2, 0);
     lv_obj_align(s_state_lbl, LV_ALIGN_TOP_MID, 0, s_small ? 22 : 40 + s_dy);
     lv_obj_set_flag(s_state_lbl, LV_OBJ_FLAG_HIDDEN, s_small && !s_tall && s_h < 200);
@@ -869,13 +884,13 @@ static void build_screen(void)
      * more than one on the bench, the screen says which one to pick in the
      * Muse app. update_chrome() fills it in, shortens it to the hex tail on a
      * screen too narrow for the whole thing, and empties it once paired. */
-    s_name_lbl = make_label(face, s_small ? &lv_font_unscii_8 : &lv_font_unscii_16, COLOR_DIM);
+    s_name_lbl = make_label(face, s_small ? &lv_font_unscii_8 : &s_font_unscii_16_cjk, COLOR_DIM);
     lv_obj_align(s_name_lbl, LV_ALIGN_TOP_MID, 0, s_small ? 32 : 60 + s_dy);
     /* Same rule as the state label: a square 128 px screen centres Muse over
      * these rows, so there's nowhere to put this without covering the face. */
     lv_obj_set_flag(s_name_lbl, LV_OBJ_FLAG_HIDDEN, s_small && !s_tall && s_h < 200);
 
-    s_caption_lbl = make_label(face, font_pick(&lv_font_unscii_16, &lv_font_unscii_8), COLOR_CAPTION);
+    s_caption_lbl = make_label(face, font_pick(&s_font_unscii_16_cjk, &lv_font_unscii_8), COLOR_CAPTION);
     if (s_small) {
         /* Two lines over the bottom of the face, on a dark band so they stay
          * legible. A tall screen has room to keep them above the mic icon. */
@@ -1199,7 +1214,7 @@ static void update_chrome(float now)
      * read layout unhides it on the way out. A narrow screen gets the hex tail
      * on its own, which is the part that differs between two of them, rather
      * than a head that ends in dots before it gets there. */
-    const lv_font_t *name_font = s_small ? &lv_font_unscii_8 : &lv_font_unscii_16;
+    const lv_font_t *name_font = s_small ? &lv_font_unscii_8 : &s_font_unscii_16_cjk;
     int name_cw = lv_font_get_glyph_width(name_font, 'M', ' ');
     const char *shown = paired ? "" : b.name;
     if (name_cw > 0 && (int)strlen(shown) * name_cw > s_w) {

@@ -113,17 +113,23 @@ static bool next_line(const char **text, int cols, const char **start, size_t *l
         size_t bytes;
         char shown[4];
         int w = muse_text_ascii(end, &bytes, shown);
-        w = w < 0 ? 1 : w;
+        if (w < 0) {
+            /* Multi-byte UTF-8 character (e.g. CJK character/punctuation) takes 2 columns */
+            w = (bytes > 1) ? 2 : 1;
+        }
         if (n + w > cols && n) {
             break;
         }
         if (*end == ' ') {
             brk = end;
+        } else if (bytes > 1) {
+            /* Any CJK character boundary is a valid break opportunity */
+            brk = end + bytes;
         }
         n += w;
         end += bytes;
     }
-    if (*end && *end != ' ' && *end != '\n' && brk) {
+    if (*end && *end != ' ' && *end != '\n' && brk && brk <= end) {
         end = brk;   /* don't split a word */
     }
     *start = p;

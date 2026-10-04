@@ -57,3 +57,5 @@ CONFIG_SPIRAM_IGNORE_NOTFOUND=n
 # That forces Wi-Fi's TX buffers static, in internal RAM: 8, not 16, at 1.6 KB
 # each, which voice over the tunnel doesn't fill.
 CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=8
+CONFIG_MUSE_VOCAT_HEAD_THRESHOLD=5
+

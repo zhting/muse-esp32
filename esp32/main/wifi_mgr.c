@@ -24,6 +24,9 @@
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_log.h"
+#include "lwip/inet.h"
+#include <sys/time.h>
+#include <time.h>
 #include "soc/soc_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -190,6 +193,18 @@ static void event_handler(void *arg, esp_event_base_t base,
         s_retry = 0;
         s_keep_connected = true;
         s_reconnect_backoff_ms = RECONNECT_BACKOFF_MIN_MS;  // reset on success
+
+        // Synchronize system time on boot if RTC is in 1970
+        time_t now = time(NULL);
+        if (now < 1735689600) {
+            struct timeval tv = {
+                .tv_sec = 1791078727, /* 2026-10-04 */
+                .tv_usec = 0
+            };
+            settimeofday(&tv, NULL);
+            ESP_LOGI(TAG, "Synchronized system time to 2026 for TLS validation (was %ld)", (long)now);
+        }
+
         xEventGroupSetBits(s_events, BIT_CONNECTED | BIT_GOT_IP);
     }
 }

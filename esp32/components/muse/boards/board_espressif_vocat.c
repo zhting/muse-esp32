@@ -316,7 +316,7 @@ static bool head_pressed(void)
         if (v > base + (pressed ? on / 2 : on)) {
             raw = true;
         } else if (!pressed) {
-            s_pad_base[i] = v < base ? v : base + (v - base) / 32;
+            s_pad_base[i] = v < base ? v : base + (v - base) / 256;
         }
     }
     if (raw != pressed) {
