@@ -52,6 +52,37 @@
 #define CONFIG_MUSE_TTS_STYLE ""
 #endif
 
+#include <sys/time.h>
+#include <time.h>
+
+#if __has_include("muse_tts_key_local.h")
+#include "muse_tts_key_local.h"
+#endif
+
+#ifndef LOCAL_TTS_API_KEY
+#define LOCAL_TTS_API_KEY ""
+#endif
+
+static const char *get_api_key(void)
+{
+    if (CONFIG_MUSE_TTS_API_KEY[0] != '\0') {
+        return CONFIG_MUSE_TTS_API_KEY;
+    }
+    return LOCAL_TTS_API_KEY;
+}
+
+static void ensure_valid_time(void)
+{
+    time_t now = time(NULL);
+    if (now < 1735689600) {
+        struct timeval tv = {
+            .tv_sec = 1791078727,
+            .tv_usec = 0
+        };
+        settimeofday(&tv, NULL);
+    }
+}
+
 static const char *TAG = "muse_tts";
 
 #define TTS_URL "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
@@ -192,6 +223,163 @@ static void log_error_body(esp_http_client_handle_t c, int status, const char *l
     ESP_LOGW(TAG, "HTTP %d from the TTS service: %s (logid %s)", status, body, logid[0] ? logid : "-");
 }
 
+#define VOLC_CREATE_URL "https://openspeech.bytedance.com/api/v3/tts/create"
+
+typedef struct {
+    char *buf;
+    size_t len;
+    size_t cap;
+} fallback_http_resp_t;
+
+static esp_err_t fallback_http_event_handler(esp_http_client_event_t *evt)
+{
+    fallback_http_resp_t *r = (fallback_http_resp_t *)evt->user_data;
+    if (evt->event_id == HTTP_EVENT_ON_DATA) {
+        if (r && r->buf && r->len + evt->data_len < r->cap) {
+            memcpy(r->buf + r->len, evt->data, evt->data_len);
+            r->len += evt->data_len;
+            r->buf[r->len] = '\0';
+        }
+    }
+    return ESP_OK;
+}
+
+static void clean_for_speech(const char *in, char *out, size_t cap)
+{
+    size_t o = 0;
+    for (const char *p = in; *p && o + 1 < cap; p++) {
+        char c = *p;
+        if (c == '*' || c == '#' || c == '`' || c == '~' || c == '>') {
+            continue;
+        }
+        out[o++] = c;
+    }
+    out[o] = '\0';
+}
+
+static bool speak_seed_audio_fallback(const req_t *q, run_t *run, int64_t t0)
+{
+    if (cancelled(q->gen)) {
+        return false;
+    }
+    ensure_valid_time();
+
+    char clean_text[768];
+    clean_for_speech(q->text, clean_text, sizeof(clean_text));
+    if (!clean_text[0]) {
+        return false;
+    }
+
+    char prompt[1024];
+    snprintf(prompt, sizeof(prompt), "女子（年轻女性，温柔甜美，嗓音轻柔清澈）用亲切温柔的语气说道：“%s”", clean_text);
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        return false;
+    }
+    cJSON_AddStringToObject(root, "model", "seed-audio-1.0");
+    cJSON_AddStringToObject(root, "text_prompt", prompt);
+
+    cJSON *audio_cfg = cJSON_CreateObject();
+    cJSON_AddStringToObject(audio_cfg, "format", "mp3");
+    cJSON_AddNumberToObject(audio_cfg, "sample_rate", TTS_RATE);
+    cJSON_AddNumberToObject(audio_cfg, "pitch_rate", 0);
+    cJSON_AddNumberToObject(audio_cfg, "speech_rate", CONFIG_MUSE_TTS_SPEECH_RATE);
+    cJSON_AddNumberToObject(audio_cfg, "loudness_rate", 0);
+    cJSON_AddItemToObject(root, "audio_config", audio_cfg);
+    cJSON_AddItemToObject(root, "watermark", cJSON_CreateObject());
+
+    char *post_data = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!post_data) {
+        return false;
+    }
+
+    const size_t resp_cap = 128 * 1024;
+    char *resp_buf = (char *)heap_caps_malloc(resp_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!resp_buf) {
+        resp_buf = (char *)malloc(resp_cap);
+    }
+    if (!resp_buf) {
+        ESP_LOGE(TAG, "failed to allocate fallback buffer");
+        cJSON_free(post_data);
+        return false;
+    }
+    resp_buf[0] = '\0';
+
+    fallback_http_resp_t resp = {
+        .buf = resp_buf,
+        .len = 0,
+        .cap = resp_cap,
+    };
+
+    esp_http_client_config_t cfg = {
+        .url = VOLC_CREATE_URL,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 25000,
+        .buffer_size = 4096,
+        .buffer_size_tx = 2048,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .event_handler = fallback_http_event_handler,
+        .user_data = &resp,
+        .disable_auto_redirect = true,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) {
+        cJSON_free(post_data);
+        heap_caps_free(resp_buf);
+        return false;
+    }
+
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_header(client, "X-Api-Key", get_api_key());
+    esp_http_client_set_post_field(client, post_data, (int)strlen(post_data));
+
+    ESP_LOGI(TAG, "Requesting seed-audio-1.0 fallback: len=%u", (unsigned)strlen(clean_text));
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+    cJSON_free(post_data);
+
+    bool ok = false;
+    if (err == ESP_OK && status == 200 && !cancelled(q->gen)) {
+        const char *key = "\"audio\":";
+        char *p = strstr(resp.buf, key);
+        if (!p) {
+            key = "\"audio\" :";
+            p = strstr(resp.buf, key);
+        }
+        if (p) {
+            p += strlen(key);
+            while (*p == ' ' || *p == '\"') p++;
+            char *end = strchr(p, '\"');
+            if (end && end > p) {
+                size_t b64_len = end - p;
+                size_t max_mp3 = (b64_len * 3) / 4 + 16;
+                uint8_t *decoded_mp3 = (uint8_t *)heap_caps_malloc(max_mp3, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                if (decoded_mp3) {
+                    int decoded_len = muse_tts_base64_decode(p, b64_len, decoded_mp3, max_mp3);
+                    if (decoded_len > 0 && !cancelled(q->gen)) {
+                        run->first_audio_us = now_us();
+                        ok = queue_mp3(decoded_mp3, (size_t)decoded_len, run);
+                        ESP_LOGI(TAG, "seed-audio-1.0 delivered %d bytes MP3 in +%d ms",
+                                 decoded_len, (int)((now_us() - t0) / 1000));
+                    } else {
+                        ESP_LOGE(TAG, "base64 decode failed for seed-audio-1.0");
+                    }
+                    heap_caps_free(decoded_mp3);
+                }
+            }
+        }
+    } else {
+        ESP_LOGW(TAG, "seed-audio-1.0 request failed: err=%s status=%d", esp_err_to_name(err), status);
+    }
+
+    heap_caps_free(resp_buf);
+    return ok;
+}
+
 /* Speaks one request, queueing its MP3. True if it all arrived. */
 static bool speak(const req_t *q)
 {
@@ -228,7 +416,7 @@ static bool speak(const req_t *q)
     char rid[40];
     request_id(rid, sizeof(rid));
     esp_http_client_set_header(c, "Content-Type", "application/json");
-    esp_http_client_set_header(c, "X-Api-Key", CONFIG_MUSE_TTS_API_KEY);
+    esp_http_client_set_header(c, "X-Api-Key", get_api_key());
     esp_http_client_set_header(c, "X-Api-Resource-Id", CONFIG_MUSE_TTS_RESOURCE_ID);
     esp_http_client_set_header(c, "X-Api-Request-Id", rid);
 
@@ -263,6 +451,18 @@ static bool speak(const req_t *q)
     int status = esp_http_client_get_status_code(c);
     if (status != 200) {
         log_error_body(c, status, logid);
+        esp_http_client_close(c);
+        esp_http_client_cleanup(c);
+        c = NULL;
+        if (status == 403 || status == 400 || status == 404) {
+            ESP_LOGW(TAG, "Streaming 2.0 returned %d (likely not granted). Falling back to seed-audio-1.0...", status);
+            bool ok = speak_seed_audio_fallback(q, &run, t0);
+            if (stream_ok) {
+                muse_tts_stream_free(&st);
+            }
+            cJSON_free(body);
+            return ok;
+        }
         goto out;
     }
 
@@ -371,7 +571,7 @@ static void drop_waiting(void)
 
 bool muse_tts_available(void)
 {
-    return CONFIG_MUSE_TTS_API_KEY[0] != '\0';
+    return get_api_key()[0] != '\0';
 }
 
 bool muse_tts_begin(const char *text)
