@@ -952,6 +952,7 @@ static void turn_reset_streams(void)
 
 static void turn_finish(void)
 {
+    muse_tts_cancel();
     turn_reset_streams();
     s_turn.phase = P_IDLE;
     s_turn.dict_id = s_turn.chat_id = 0;
@@ -1504,22 +1505,34 @@ static void start_tts(void)
             continue;
         }
 
-        const char *text = s_turn.texts ? (s_turn.texts + i * TEXT_MAX) : nullptr;
-        int mp3_len = 0;
-        if (text && text[0]) {
-            ESP_LOGI(TAG, "Calling Volcengine TTS for msg %s: %s", m.id, text);
-            mp3_len = muse_tts_fetch(text, s_turn.mp3, MP3_BUF);
+        /* 扬声器静音或关闭时：不请求网络 TTS，直接显示字幕并按阅读速度推进 */
+        int vol = muse_settings_volume();
+        if (vol <= 0) {
+            m.pcm_start = s_turn.pcm_out;
+            m.pcm_frames = (uint32_t)(m.len * MIC_RATE / TEXT_CHARS_PER_S);
+            m.tts = TTS_ACTIVE;
+            s_turn.tts_msg = i;
+            s_turn.silent = true;
+            ESP_LOGI(TAG, "showing message %s (%u chars, speaker silent)", m.id, (unsigned)m.len);
+            show_reply_start(m);
+            return;
         }
 
-        if (mp3_len > 0) {
-            ESP_LOGI(TAG, "Volcengine TTS playback starting: %d bytes MP3", mp3_len);
+        const char *text = s_turn.texts ? (s_turn.texts + i * TEXT_MAX) : nullptr;
+        bool started = false;
+        if (text && text[0]) {
+            ESP_LOGI(TAG, "Starting streaming Volcengine TTS 2.0 for msg %s: %s", m.id, text);
+            started = muse_tts_start(text);
+        }
+
+        if (started) {
             m.tts = TTS_ACTIVE;
             s_turn.tts_msg = i;
             s_turn.silent = false;
             m.pcm_start = s_turn.pcm_out;
             m.pcm_frames = 0;
-            s_turn.mp3_len = (size_t)mp3_len;
-            s_turn.mp3_ended = true;
+            s_turn.mp3_len = 0;
+            s_turn.mp3_ended = false;
             s_turn.kbps = 0;
             s_turn.down_rate = 0;
             mp3dec_init(&s_turn.dec);
@@ -1988,6 +2001,16 @@ static void hatch_task(void *arg)
         }
         if (s_turn.phase == P_WAIT_REPLY) {
             start_tts();
+            if (s_turn.tts_msg >= 0 && !s_turn.silent) {
+                uint8_t chunk[1024];
+                size_t n = muse_tts_read_chunk(chunk, sizeof(chunk));
+                if (n > 0) {
+                    tts_data(chunk, n);
+                }
+                if (muse_tts_is_finished()) {
+                    s_turn.mp3_ended = true;
+                }
+            }
             decode();
         }
         if (!s_connected) {
