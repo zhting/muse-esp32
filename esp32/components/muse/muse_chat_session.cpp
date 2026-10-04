@@ -2002,10 +2002,14 @@ static void hatch_task(void *arg)
         if (s_turn.phase == P_WAIT_REPLY) {
             start_tts();
             if (s_turn.tts_msg >= 0 && !s_turn.silent) {
-                uint8_t chunk[1024];
-                size_t n = muse_tts_read_chunk(chunk, sizeof(chunk));
-                if (n > 0) {
+                uint8_t chunk[2048];
+                size_t n;
+                while ((n = muse_tts_read_chunk(chunk, sizeof(chunk))) > 0) {
                     tts_data(chunk, n);
+                    s_conn.last_rx_us = now_us();
+                    if (s_turn.mp3_len >= MP3_BUF - sizeof(chunk)) {
+                        break;
+                    }
                 }
                 if (muse_tts_is_finished()) {
                     s_turn.mp3_ended = true;
