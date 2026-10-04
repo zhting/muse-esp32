@@ -28,13 +28,14 @@ static const char *TAG = "muse_tts";
 #define VOLC_RESOURCE_ID "seed-tts-2.0"
 #define VOLC_SPEAKER "zh_female_wenrouxiaoya_uranus_bigtts"
 
-#ifndef CONFIG_VOLC_TTS_API_KEY
-#define VOLC_TTS_DEFAULT_KEY ""
+#if __has_include("volc_key_local.h")
+#include "volc_key_local.h"
+#define VOLC_API_KEY VOLC_LOCAL_API_KEY
+#elif defined(CONFIG_VOLC_TTS_API_KEY) && (sizeof(CONFIG_VOLC_TTS_API_KEY) > 1)
+#define VOLC_API_KEY CONFIG_VOLC_TTS_API_KEY
 #else
-#define VOLC_TTS_DEFAULT_KEY CONFIG_VOLC_TTS_API_KEY
+#define VOLC_API_KEY "YOUR_VOLCENGINE_API_KEY"
 #endif
-
-#define VOLC_API_KEY (sizeof(VOLC_TTS_DEFAULT_KEY) > 1 ? VOLC_TTS_DEFAULT_KEY : "YOUR_VOLCENGINE_API_KEY")
 
 #define STREAM_BUF_SIZE (64 * 1024)
 #define READ_CHUNK_SIZE 1024

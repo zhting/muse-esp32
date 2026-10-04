@@ -24,3 +24,7 @@ muse-simulator.ppm
 # Local gadget provisioning and original-device flash backups.
 .sdk-token
 /backups/
+
+# Local secret keys
+*key_local.h
+volc_key_local.h
