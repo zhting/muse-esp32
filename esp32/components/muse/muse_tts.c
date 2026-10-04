@@ -1,477 +1,436 @@
 /*
- * Volcengine Streaming TTS client for Muse Gadget
- * Model: DoubaoVoice 2.0 (seed-tts-2.0, unidirectional streaming)
- * Speaker: zh_female_wenrouxiaoya_uranus_bigtts (温柔小雅 2.0)
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Speaks Muse's replies with Volcengine's streaming TTS: 豆包语音合成, HTTP
+ * chunked V3 (POST /api/v3/tts/unidirectional, X-Api-Key auth). A task of its
+ * own makes the request and queues the MP3 as each piece arrives; the chat
+ * session plays it from there. Speech starts with the first piece, about a
+ * second after the request (TLS handshake plus the service's first packet),
+ * where waiting for a whole synthesized clip took as long as the clip.
+ *
+ * Settings, under menuconfig > Muse > Speech: the API key (keep it out of
+ * git: set it in your build directory's sdkconfig), the resource ID, voice,
+ * speech rate and an optional speaking instruction for 2.0 voices.
  */
 
 #include "muse_tts.h"
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <stdatomic.h>
+#include <stdio.h>
+#include <string.h>
+#include <strings.h>
 
-#include "esp_log.h"
-#include "esp_http_client.h"
+#include "cJSON.h"
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
+#include "esp_http_client.h"
+#include "esp_log.h"
+#include "esp_random.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
+#include "freertos/idf_additions.h"
 #include "freertos/queue.h"
 #include "freertos/stream_buffer.h"
-#include "mbedtls/base64.h"
-#include "cJSON.h"
+#include "freertos/task.h"
+#include "muse_tts_stream.h"
+#include "sdkconfig.h"
+
+/* Builds that don't offer the settings (no Muse voice session) get TTS off. */
+#ifndef CONFIG_MUSE_TTS_API_KEY
+#define CONFIG_MUSE_TTS_API_KEY ""
+#endif
+#ifndef CONFIG_MUSE_TTS_RESOURCE_ID
+#define CONFIG_MUSE_TTS_RESOURCE_ID "seed-tts-2.0"
+#endif
+#ifndef CONFIG_MUSE_TTS_SPEAKER
+#define CONFIG_MUSE_TTS_SPEAKER "zh_female_wenrouxiaoya_uranus_bigtts"
+#endif
+#ifndef CONFIG_MUSE_TTS_SPEECH_RATE
+#define CONFIG_MUSE_TTS_SPEECH_RATE 0
+#endif
+#ifndef CONFIG_MUSE_TTS_STYLE
+#define CONFIG_MUSE_TTS_STYLE ""
+#endif
 
 static const char *TAG = "muse_tts";
 
-#define VOLC_STREAM_URL "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
-#define VOLC_RESOURCE_ID "seed-tts-2.0"
-#define VOLC_SPEAKER "zh_female_wenrouxiaoya_uranus_bigtts"
-#define VOLC_FALLBACK_URL "https://openspeech.bytedance.com/api/v3/tts/create"
-
-#if __has_include("volc_key_local.h")
-#include "volc_key_local.h"
-#define VOLC_API_KEY VOLC_LOCAL_API_KEY
-#elif defined(CONFIG_VOLC_TTS_API_KEY) && (sizeof(CONFIG_VOLC_TTS_API_KEY) > 1)
-#define VOLC_API_KEY CONFIG_VOLC_TTS_API_KEY
-#else
-#define VOLC_API_KEY "YOUR_VOLCENGINE_API_KEY"
+#define TTS_URL "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
+#define TTS_RATE 16000                       /* the speaker's rate, so nothing is resampled */
+#define QUEUE_BYTES (64 * 1024)              /* MP3 that has arrived and isn't taken yet */
+#define PIECE_CAP (16 * 1024)                /* one JSON piece of the body, to start with */
+#define PIECE_MAX (512 * 1024)               /* ...and at most */
+#define READ_BYTES 1024                      /* small reads hand each piece over as it lands */
+#define CONNECT_TIMEOUT_MS 10000             /* DNS, TCP, TLS and sending the request */
+#define LOGID_MAX 72
+/* The host test (tests/test_muse_tts.py) shortens these. */
+#ifndef HEADERS_POLL_MS
+#define HEADERS_POLL_MS 3000                 /* waiting for the answer (shorter logs a warning each time) */
 #endif
-
-#define STREAM_BUF_SIZE (64 * 1024)
-#define READ_CHUNK_SIZE 1024
-#define LINE_BUF_SIZE 4096
-#define DECODE_BUF_SIZE 2048
-
-static StreamBufferHandle_t s_mp3_stream = NULL;
-static QueueHandle_t s_cmd_queue = NULL;
-static TaskHandle_t s_task_handle = NULL;
-
-static atomic_bool s_tts_running = ATOMIC_VAR_INIT(false);
-static atomic_bool s_tts_cancelled = ATOMIC_VAR_INIT(false);
-static atomic_bool s_server_done = ATOMIC_VAR_INIT(true);
+#ifndef POLL_MS
+#define POLL_MS 200                          /* reading the stream: how soon a cancel is noticed */
+#endif
+#ifndef FIRST_AUDIO_TIMEOUT_US
+#define FIRST_AUDIO_TIMEOUT_US (20 * 1000000LL)
+#endif
+#ifndef STALL_TIMEOUT_US
+#define STALL_TIMEOUT_US (10 * 1000000LL)    /* no data mid-stream */
+#endif
 
 typedef struct {
     char *text;
-} tts_cmd_t;
+    uint32_t gen;
+} req_t;
 
-/* 解析单行 JSON 并提取 MP3 数据 */
-static void process_json_line(const char *line)
+typedef struct {
+    uint32_t gen;
+    int64_t first_audio_us;
+} run_t;
+
+static QueueHandle_t s_reqs;
+static StreamBufferHandle_t s_mp3;
+static atomic_uint s_gen;           /* the latest request; begin and cancel bump it */
+static atomic_uint s_queued_gen;    /* whose MP3 s_mp3 holds */
+static atomic_uint s_result_gen;    /* which request s_result is for */
+static atomic_int s_result;
+
+static int64_t now_us(void)
 {
-    /* 检查结束码 code: 20000000 */
-    if (strstr(line, "\"code\":20000000") || strstr(line, "\"code\": 20000000")) {
-        ESP_LOGI(TAG, "Volcengine TTS streaming completed (code: 20000000)");
-        atomic_store(&s_server_done, true);
-        return;
-    }
-
-    /* 定位 \"data\": \"...\" */
-    const char *data_key = "\"data\":\"";
-    char *p = strstr(line, data_key);
-    if (!p) {
-        data_key = "\"data\": \"";
-        p = strstr(line, data_key);
-    }
-
-    if (p) {
-        p += strlen(data_key);
-        char *end = strchr(p, '\"');
-        if (end && end > p) {
-            size_t b64_len = end - p;
-            static uint8_t dec_buf[DECODE_BUF_SIZE];
-            size_t olen = 0;
-            int ret = mbedtls_base64_decode(dec_buf, sizeof(dec_buf), &olen, (const unsigned char *)p, b64_len);
-            if (ret == 0 && olen > 0 && s_mp3_stream) {
-                xStreamBufferSend(s_mp3_stream, dec_buf, olen, pdMS_TO_TICKS(50));
-            }
-        }
-    } else {
-        /* 如果不是数据行，打印可能的错误日志 */
-        if (!strstr(line, "\"code\":0") && !strstr(line, "\"code\": 0")) {
-            ESP_LOGW(TAG, "TTS response line: %.120s", line);
-        }
-    }
+    return esp_timer_get_time();
 }
 
-static void fetch_fallback_seed_audio(const char *text)
+static void *psram_realloc(void *ptr, size_t size)
 {
-    ESP_LOGI(TAG, "Falling back to seed-audio-1.0 for speech generation: %.64s", text);
-    char prompt[1024];
-    snprintf(prompt, sizeof(prompt), "女子（年轻女性，温柔甜美，嗓音轻柔清澈）用亲切温柔的语气说道：“%s”", text);
-
-    cJSON *root = cJSON_CreateObject();
-    if (!root) return;
-    cJSON_AddStringToObject(root, "model", "seed-audio-1.0");
-    cJSON_AddStringToObject(root, "text_prompt", prompt);
-    cJSON *audio_cfg = cJSON_CreateObject();
-    cJSON_AddStringToObject(audio_cfg, "format", "mp3");
-    cJSON_AddNumberToObject(audio_cfg, "sample_rate", 16000);
-    cJSON_AddItemToObject(root, "audio_config", audio_cfg);
-    char *post_data = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
-    if (!post_data) return;
-
-    size_t resp_cap = 128 * 1024;
-    char *resp_buf = (char *)heap_caps_malloc(resp_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!resp_buf) resp_buf = (char *)malloc(resp_cap);
-    if (!resp_buf) {
-        free(post_data);
-        return;
-    }
-    resp_buf[0] = '\0';
-    size_t resp_len = 0;
-
-    esp_http_client_config_t config = {
-        .url = VOLC_FALLBACK_URL,
-        .method = HTTP_METHOD_POST,
-        .timeout_ms = 25000,
-        .buffer_size = 2048,
-        .buffer_size_tx = 2048,
-        .crt_bundle_attach = esp_crt_bundle_attach,
-        .disable_auto_redirect = true,
-    };
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (!client) {
-        free(post_data);
-        heap_caps_free(resp_buf);
-        return;
-    }
-    esp_http_client_set_header(client, "Content-Type", "application/json");
-    esp_http_client_set_header(client, "X-Api-Key", VOLC_API_KEY);
-
-    int post_len = strlen(post_data);
-    esp_err_t err = esp_http_client_open(client, post_len);
-    if (err == ESP_OK) {
-        esp_http_client_write(client, post_data, post_len);
-        esp_http_client_fetch_headers(client);
-        int status = esp_http_client_get_status_code(client);
-        if (status == 200) {
-            while (!atomic_load(&s_tts_cancelled)) {
-                int r = esp_http_client_read(client, resp_buf + resp_len, (int)(resp_cap - 1 - resp_len));
-                if (r <= 0) break;
-                resp_len += r;
-                resp_buf[resp_len] = '\0';
-                if (resp_len >= resp_cap - 1) break;
-            }
-        } else {
-            ESP_LOGW(TAG, "Fallback seed-audio-1.0 HTTP status %d", status);
-        }
-    }
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
-    free(post_data);
-
-    if (resp_len > 0 && !atomic_load(&s_tts_cancelled)) {
-        const char *key = "\"audio\":";
-        char *p = strstr(resp_buf, key);
-        if (!p) {
-            key = "\"audio\" :";
-            p = strstr(resp_buf, key);
-        }
-        if (p) {
-            p += strlen(key);
-            while (*p == ' ' || *p == '\"') p++;
-            char *end = strchr(p, '\"');
-            if (end && end > p) {
-                size_t b64_len = end - p;
-                size_t out_max = (b64_len / 4) * 3 + 4;
-                uint8_t *decoded = (uint8_t *)heap_caps_malloc(out_max, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-                if (!decoded) decoded = (uint8_t *)malloc(out_max);
-                if (decoded) {
-                    size_t olen = 0;
-                    int b64_ret = mbedtls_base64_decode(decoded, out_max, &olen, (const unsigned char *)p, b64_len);
-                    if (b64_ret == 0 && olen > 0 && s_mp3_stream) {
-                        ESP_LOGI(TAG, "Fallback successfully decoded %u bytes MP3", (unsigned)olen);
-                        size_t sent = 0;
-                        while (sent < olen && !atomic_load(&s_tts_cancelled)) {
-                            size_t to_send = olen - sent;
-                            if (to_send > 2048) to_send = 2048;
-                            size_t actual = xStreamBufferSend(s_mp3_stream, decoded + sent, to_send, pdMS_TO_TICKS(500));
-                            if (actual == 0) break;
-                            sent += actual;
-                        }
-                    } else {
-                        ESP_LOGE(TAG, "Fallback base64 decode failed: ret=%d", b64_ret);
-                    }
-                    heap_caps_free(decoded);
-                }
-            }
-        } else {
-            ESP_LOGE(TAG, "Fallback JSON missing \"audio\" field: %.100s", resp_buf);
-        }
-    }
-
-    heap_caps_free(resp_buf);
+    return heap_caps_realloc_prefer(ptr, size, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_DEFAULT);
 }
 
-static void tts_worker_task(void *arg)
+static bool cancelled(uint32_t gen)
 {
-    (void)arg;
-    char *line_buf = (char *)heap_caps_malloc(LINE_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!line_buf) {
-        line_buf = (char *)malloc(LINE_BUF_SIZE);
-    }
-    char *read_buf = (char *)malloc(READ_CHUNK_SIZE);
-
-    tts_cmd_t cmd;
-    while (1) {
-        if (xQueueReceive(s_cmd_queue, &cmd, portMAX_DELAY) != pdTRUE) {
-            continue;
-        }
-
-        if (!cmd.text) {
-            continue;
-        }
-
-        atomic_store(&s_tts_running, true);
-        atomic_store(&s_tts_cancelled, false);
-        atomic_store(&s_server_done, false);
-        if (s_mp3_stream) {
-            xStreamBufferReset(s_mp3_stream);
-        }
-
-        /* 1. 构造 2.0 流式 JSON 请求体 */
-        cJSON *root = cJSON_CreateObject();
-        cJSON *user = cJSON_CreateObject();
-        cJSON_AddStringToObject(user, "uid", "muse-gadget");
-        cJSON_AddItemToObject(root, "user", user);
-
-        cJSON *req = cJSON_CreateObject();
-        cJSON_AddStringToObject(req, "text", cmd.text);
-        cJSON_AddStringToObject(req, "speaker", VOLC_SPEAKER);
-
-        cJSON *audio = cJSON_CreateObject();
-        cJSON_AddStringToObject(audio, "format", "mp3");
-        cJSON_AddNumberToObject(audio, "sample_rate", 16000);
-        cJSON_AddNumberToObject(audio, "speech_rate", 0);
-        cJSON_AddItemToObject(req, "audio_params", audio);
-
-        cJSON_AddStringToObject(req, "additions", "{\"disable_markdown_filter\":true}");
-        cJSON_AddItemToObject(root, "req_params", req);
-
-        char *post_data = cJSON_PrintUnformatted(root);
-        cJSON_Delete(root);
-
-        if (!post_data) {
-            ESP_LOGE(TAG, "Failed to create JSON payload");
-            free(cmd.text);
-            atomic_store(&s_server_done, true);
-            atomic_store(&s_tts_running, false);
-            continue;
-        }
-
-        /* 2. 发起 HTTP POST 请求 */
-        esp_http_client_config_t config = {
-            .url = VOLC_STREAM_URL,
-            .method = HTTP_METHOD_POST,
-            .timeout_ms = 10000,
-            .buffer_size = 2048,
-            .buffer_size_tx = 2048,
-            .crt_bundle_attach = esp_crt_bundle_attach,
-            .disable_auto_redirect = true,
-        };
-
-        esp_http_client_handle_t client = esp_http_client_init(&config);
-        if (!client) {
-            ESP_LOGE(TAG, "Failed to init HTTP client");
-            free(post_data);
-            free(cmd.text);
-            atomic_store(&s_server_done, true);
-            atomic_store(&s_tts_running, false);
-            continue;
-        }
-
-        esp_http_client_set_header(client, "Content-Type", "application/json");
-        esp_http_client_set_header(client, "X-Api-Key", VOLC_API_KEY);
-        esp_http_client_set_header(client, "X-Api-Resource-Id", VOLC_RESOURCE_ID);
-
-        int post_len = strlen(post_data);
-        esp_err_t err = esp_http_client_open(client, post_len);
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "HTTP client open failed: %s", esp_err_to_name(err));
-            goto cleanup;
-        }
-
-        int written = esp_http_client_write(client, post_data, post_len);
-        if (written < 0) {
-            ESP_LOGW(TAG, "HTTP client write failed");
-            goto cleanup;
-        }
-
-        int content_len = esp_http_client_fetch_headers(client);
-        int status = esp_http_client_get_status_code(client);
-        (void)content_len;
-        if (status != 200) {
-            ESP_LOGW(TAG, "Streaming TTS 2.0 returned HTTP %d, falling back to seed-audio-1.0...", status);
-            esp_http_client_close(client);
-            esp_http_client_cleanup(client);
-            client = NULL;
-
-            if (!atomic_load(&s_tts_cancelled)) {
-                fetch_fallback_seed_audio(cmd.text);
-            }
-            goto cleanup;
-        }
-
-        /* 3. 流式读取并按行解析 */
-        size_t line_pos = 0;
-        while (!atomic_load(&s_tts_cancelled)) {
-            int r = esp_http_client_read(client, read_buf, READ_CHUNK_SIZE);
-            if (r < 0) {
-                ESP_LOGW(TAG, "HTTP read error: %d", r);
-                break;
-            }
-            if (r == 0) {
-                /* 对端关闭或传输结束 */
-                break;
-            }
-
-            for (int i = 0; i < r; i++) {
-                char c = read_buf[i];
-                if (c == '\n') {
-                    if (line_buf && line_pos > 0) {
-                        line_buf[line_pos] = '\0';
-                        process_json_line(line_buf);
-                        line_pos = 0;
-                    }
-                    if (atomic_load(&s_server_done)) {
-                        break;
-                    }
-                } else if (c != '\r') {
-                    if (line_buf && line_pos + 1 < LINE_BUF_SIZE) {
-                        line_buf[line_pos++] = c;
-                    }
-                }
-            }
-
-            if (atomic_load(&s_server_done)) {
-                break;
-            }
-        }
-
-        /* 处理尾部可能未带换行符的一行 */
-        if (line_buf && line_pos > 0 && !atomic_load(&s_tts_cancelled)) {
-            line_buf[line_pos] = '\0';
-            process_json_line(line_buf);
-        }
-
-cleanup:
-        if (client) {
-            esp_http_client_close(client);
-            esp_http_client_cleanup(client);
-        }
-        free(post_data);
-        free(cmd.text);
-        atomic_store(&s_server_done, true);
-        atomic_store(&s_tts_running, false);
-    }
-
-    if (line_buf) heap_caps_free(line_buf);
-    if (read_buf) free(read_buf);
-    vTaskDelete(NULL);
+    return atomic_load(&s_gen) != gen;
 }
 
-static bool ensure_tts_inited(void)
+/* The stream's sink: queues MP3 for the session, waiting while the queue is full. */
+static bool queue_mp3(const uint8_t *data, size_t len, void *ctx)
 {
-    if (s_cmd_queue && s_mp3_stream) {
-        return true;
+    run_t *run = (run_t *)ctx;
+    if (!run->first_audio_us) {
+        run->first_audio_us = now_us();
     }
-
-    if (!s_mp3_stream) {
-        s_mp3_stream = xStreamBufferCreateWithCaps(STREAM_BUF_SIZE, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!s_mp3_stream) {
-            s_mp3_stream = xStreamBufferCreate(STREAM_BUF_SIZE, 1);
-        }
-    }
-
-    if (!s_cmd_queue) {
-        s_cmd_queue = xQueueCreate(2, sizeof(tts_cmd_t));
-    }
-
-    if (!s_task_handle && s_cmd_queue && s_mp3_stream) {
-        BaseType_t ret = xTaskCreateWithCaps(
-            tts_worker_task,
-            "muse_tts",
-            8192,
-            NULL,
-            5,
-            &s_task_handle,
-            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
-        );
-        if (ret != pdPASS) {
-            ret = xTaskCreate(tts_worker_task, "muse_tts", 8192, NULL, 5, &s_task_handle);
-        }
-        if (ret != pdPASS) {
-            ESP_LOGE(TAG, "Failed to create muse_tts worker task");
+    while (len) {
+        if (cancelled(run->gen)) {
             return false;
         }
+        size_t sent = xStreamBufferSend(s_mp3, data, len, pdMS_TO_TICKS(POLL_MS));
+        data += sent;
+        len -= sent;
     }
-
-    return (s_cmd_queue && s_mp3_stream && s_task_handle);
-}
-
-bool muse_tts_start(const char *text)
-{
-    if (!text || !text[0]) {
-        return false;
-    }
-
-    if (strcmp(VOLC_API_KEY, "YOUR_VOLCENGINE_API_KEY") == 0 || strlen(VOLC_API_KEY) == 0) {
-        ESP_LOGW(TAG, "Volcengine API key not configured! Please configure CONFIG_VOLC_TTS_API_KEY or set VOLC_API_KEY");
-        return false;
-    }
-
-    if (!ensure_tts_inited()) {
-        return false;
-    }
-
-    /* 若之前有未完成的请求，先打断 */
-    muse_tts_cancel();
-
-    tts_cmd_t cmd = {
-        .text = strdup(text)
-    };
-    if (!cmd.text) {
-        return false;
-    }
-
-    /* 必须在入队前同步重置标志，防止主线程竞态判定提前结束 */
-    atomic_store(&s_tts_cancelled, false);
-    atomic_store(&s_server_done, false);
-    atomic_store(&s_tts_running, true);
-
-    ESP_LOGI(TAG, "Enqueuing streaming TTS 2.0 (unidirectional) for %u chars", (unsigned)strlen(text));
-    if (xQueueSend(s_cmd_queue, &cmd, pdMS_TO_TICKS(100)) != pdTRUE) {
-        free(cmd.text);
-        atomic_store(&s_server_done, true);
-        atomic_store(&s_tts_running, false);
-        return false;
-    }
-
     return true;
 }
 
-size_t muse_tts_read_chunk(uint8_t *out_mp3, size_t max_len)
+static esp_err_t on_http_event(esp_http_client_event_t *e)
 {
-    if (!s_mp3_stream || !out_mp3 || max_len == 0) {
-        return 0;
+    /* The service's request ID, which its support asks for. */
+    if (e->event_id == HTTP_EVENT_ON_HEADER && e->user_data && e->header_key && e->header_value &&
+        strcasecmp(e->header_key, "X-Tt-Logid") == 0) {
+        strlcpy((char *)e->user_data, e->header_value, LOGID_MAX);
     }
-    return xStreamBufferReceive(s_mp3_stream, out_mp3, max_len, 0);
+    return ESP_OK;
 }
 
-bool muse_tts_is_finished(void)
+static char *request_body(const char *text)
 {
-    if (!s_mp3_stream) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON *user = cJSON_AddObjectToObject(root, "user");
+    cJSON_AddStringToObject(user, "uid", "muse-gadget");
+    cJSON *req = cJSON_AddObjectToObject(root, "req_params");
+    cJSON_AddStringToObject(req, "text", text);
+    cJSON_AddStringToObject(req, "speaker", CONFIG_MUSE_TTS_SPEAKER);
+    cJSON *audio = cJSON_AddObjectToObject(req, "audio_params");
+    cJSON_AddStringToObject(audio, "format", "mp3");
+    cJSON_AddNumberToObject(audio, "sample_rate", TTS_RATE);
+    cJSON_AddNumberToObject(audio, "speech_rate", CONFIG_MUSE_TTS_SPEECH_RATE);
+    /* additions is a JSON object sent as a string. With disable_markdown_filter
+     * true, the service reads **this** as "this" rather than the asterisks. */
+    cJSON *add = cJSON_CreateObject();
+    cJSON_AddBoolToObject(add, "disable_markdown_filter", true);
+    if (CONFIG_MUSE_TTS_STYLE[0]) {
+        cJSON *style = cJSON_AddArrayToObject(add, "context_texts");
+        cJSON_AddItemToArray(style, cJSON_CreateString(CONFIG_MUSE_TTS_STYLE));
+    }
+    char *additions = cJSON_PrintUnformatted(add);
+    cJSON_Delete(add);
+    if (additions) {
+        cJSON_AddStringToObject(req, "additions", additions);
+        cJSON_free(additions);
+    }
+    char *body = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    return body;
+}
+
+static void request_id(char *out, size_t cap)
+{
+    uint8_t r[16];
+    esp_fill_random(r, sizeof(r));
+    snprintf(out, cap, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x", r[0], r[1], r[2],
+             r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15]);
+}
+
+/* Reads an error response's body for the log. */
+static void log_error_body(esp_http_client_handle_t c, int status, const char *logid)
+{
+    char body[256];
+    int n = 0;
+    for (int tries = 0; tries < 10 && n < (int)sizeof(body) - 1; tries++) {
+        int r = esp_http_client_read(c, body + n, sizeof(body) - 1 - n);
+        if (r > 0) {
+            n += r;
+        } else if (r != -ESP_ERR_HTTP_EAGAIN) {
+            break;
+        }
+    }
+    body[n] = '\0';
+    ESP_LOGW(TAG, "HTTP %d from the TTS service: %s (logid %s)", status, body, logid[0] ? logid : "-");
+}
+
+/* Speaks one request, queueing its MP3. True if it all arrived. */
+static bool speak(const req_t *q)
+{
+    int64_t t0 = now_us(), t_conn = 0, t_head = 0;
+    run_t run = { .gen = q->gen };
+    char logid[LOGID_MAX] = "";
+    muse_tts_stream_t st;
+    muse_tts_stream_status_t ss = MUSE_TTS_STREAM_ERROR;
+    esp_http_client_handle_t c = NULL;
+    size_t text_len = strlen(q->text);
+
+    char *body = request_body(q->text);
+    bool stream_ok = muse_tts_stream_init(&st, PIECE_CAP, PIECE_MAX, psram_realloc, queue_mp3, &run);
+    if (!body || !stream_ok) {
+        ESP_LOGE(TAG, "out of memory");
+        goto out;
+    }
+    esp_http_client_config_t cfg = {
+        .url = TTS_URL,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = CONNECT_TIMEOUT_MS,
+        .buffer_size = 4096,
+        .buffer_size_tx = 2048,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .event_handler = on_http_event,
+        .user_data = logid,
+        .disable_auto_redirect = true,
+    };
+    c = esp_http_client_init(&cfg);
+    if (!c) {
+        ESP_LOGE(TAG, "HTTP client init failed");
+        goto out;
+    }
+    char rid[40];
+    request_id(rid, sizeof(rid));
+    esp_http_client_set_header(c, "Content-Type", "application/json");
+    esp_http_client_set_header(c, "X-Api-Key", CONFIG_MUSE_TTS_API_KEY);
+    esp_http_client_set_header(c, "X-Api-Resource-Id", CONFIG_MUSE_TTS_RESOURCE_ID);
+    esp_http_client_set_header(c, "X-Api-Request-Id", rid);
+
+    int body_len = (int)strlen(body);
+    esp_err_t err = esp_http_client_open(c, body_len);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "can't reach the TTS service: %s", esp_err_to_name(err));
+        goto out;
+    }
+    if (esp_http_client_write(c, body, body_len) != body_len) {
+        ESP_LOGW(TAG, "sending the request failed");
+        goto out;
+    }
+    t_conn = now_us();
+
+    /* From here, shorter reads, so a cancel is noticed while waiting. */
+    esp_http_client_set_timeout_ms(c, HEADERS_POLL_MS);
+    for (;;) {
+        int64_t r = esp_http_client_fetch_headers(c);
+        if (r >= 0) {
+            break;
+        }
+        if (r != -ESP_ERR_HTTP_EAGAIN || cancelled(q->gen) || now_us() - t_conn > FIRST_AUDIO_TIMEOUT_US) {
+            if (!cancelled(q->gen)) {
+                ESP_LOGW(TAG, "no answer from the TTS service");
+            }
+            goto out;
+        }
+    }
+    t_head = now_us();
+    esp_http_client_set_timeout_ms(c, POLL_MS);
+    int status = esp_http_client_get_status_code(c);
+    if (status != 200) {
+        log_error_body(c, status, logid);
+        goto out;
+    }
+
+    char buf[READ_BYTES];
+    int64_t last_rx = now_us();
+    ss = MUSE_TTS_STREAM_MORE;
+    while (ss == MUSE_TTS_STREAM_MORE && !cancelled(q->gen)) {
+        int n = esp_http_client_read(c, buf, sizeof(buf));
+        if (n > 0) {
+            last_rx = now_us();
+            ss = muse_tts_stream_feed(&st, buf, (size_t)n);
+        } else if (n == -ESP_ERR_HTTP_EAGAIN) {
+            if (now_us() - last_rx > (run.first_audio_us ? STALL_TIMEOUT_US : FIRST_AUDIO_TIMEOUT_US)) {
+                ESP_LOGW(TAG, "the TTS stream stalled");
+                ss = MUSE_TTS_STREAM_ERROR;
+            }
+        } else if (n == 0 && esp_http_client_is_complete_data_received(c)) {
+            ss = muse_tts_stream_finish(&st);
+        } else {
+            ESP_LOGW(TAG, "the TTS stream broke off (%d)", n);
+            ss = MUSE_TTS_STREAM_ERROR;
+        }
+    }
+    if (ss == MUSE_TTS_STREAM_ERROR && !cancelled(q->gen)) {
+        ESP_LOGW(TAG, "TTS failed: %s (code %d, logid %s)", st.message[0] ? st.message : "see above", st.code,
+                 logid[0] ? logid : "-");
+    }
+
+out:
+    if (c) {
+        esp_http_client_close(c);
+        esp_http_client_cleanup(c);
+    }
+    bool ok = ss == MUSE_TTS_STREAM_END && !cancelled(q->gen);
+    if (cancelled(q->gen)) {
+        ESP_LOGI(TAG, "cancelled");
+    } else {
+        /* Where the time went: connected = DNS + TCP + TLS + request sent;
+         * answered = response headers; first audio = the first piece decoded. */
+        ESP_LOGI(TAG, "%u bytes of text -> %u bytes of MP3: connected +%d ms, answered +%d ms, first audio +%d ms, "
+                      "done +%d ms",
+                 (unsigned)text_len, (unsigned)(stream_ok ? st.audio_bytes : 0),
+                 t_conn ? (int)((t_conn - t0) / 1000) : -1, t_head ? (int)((t_head - t0) / 1000) : -1,
+                 run.first_audio_us ? (int)((run.first_audio_us - t0) / 1000) : -1, (int)((now_us() - t0) / 1000));
+    }
+    if (stream_ok) {
+        muse_tts_stream_free(&st);
+    }
+    cJSON_free(body);
+    return ok;
+}
+
+static void tts_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        req_t q;
+        if (xQueueReceive(s_reqs, &q, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        if (!cancelled(q.gen)) {
+            /* This task is the only writer, and the session never waits on it,
+             * so it can be reset. Until s_queued_gen says so, nothing takes. */
+            xStreamBufferReset(s_mp3);
+            atomic_store(&s_queued_gen, q.gen);
+            bool ok = speak(&q);
+            atomic_store(&s_result, ok ? MUSE_TTS_DONE : MUSE_TTS_FAILED);
+            atomic_store(&s_result_gen, q.gen);
+        }
+        heap_caps_free(q.text);
+    }
+}
+
+static bool start(void)
+{
+    static bool started;
+    if (started) {
         return true;
     }
-    return atomic_load(&s_server_done) && (xStreamBufferBytesAvailable(s_mp3_stream) == 0);
+    /* Both exist before the task does: it waits on s_reqs as soon as it runs. */
+    if (!s_reqs) {
+        s_reqs = xQueueCreate(1, sizeof(req_t));
+    }
+    if (!s_mp3) {
+        s_mp3 = xStreamBufferCreateWithCaps(QUEUE_BYTES, 1, MALLOC_CAP_SPIRAM);
+    }
+    /* Stack in PSRAM, like the chat session's, which runs TLS the same way. */
+    if (!s_reqs || !s_mp3 ||
+        xTaskCreatePinnedToCoreWithCaps(tts_task, "muse_tts", 16 * 1024, NULL, 4, NULL, 0,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+        ESP_LOGE(TAG, "start failed");
+        return false;   /* tried again with the next message */
+    }
+    started = true;
+    ESP_LOGI(TAG, "speaking replies with %s (%s)", CONFIG_MUSE_TTS_SPEAKER, CONFIG_MUSE_TTS_RESOURCE_ID);
+    return true;
+}
+
+static void drop_waiting(void)
+{
+    req_t stale;
+    while (xQueueReceive(s_reqs, &stale, 0) == pdTRUE) {
+        heap_caps_free(stale.text);
+    }
+}
+
+bool muse_tts_available(void)
+{
+    return CONFIG_MUSE_TTS_API_KEY[0] != '\0';
+}
+
+bool muse_tts_begin(const char *text)
+{
+    if (!muse_tts_available()) {
+        static bool said;
+        if (!said) {
+            said = true;
+            ESP_LOGI(TAG, "no TTS API key (CONFIG_MUSE_TTS_API_KEY): replies are shown, not spoken");
+        }
+        return false;
+    }
+    if (!text || !text[0] || !start()) {
+        return false;
+    }
+    size_t n = strlen(text) + 1;
+    char *copy = heap_caps_malloc_prefer(n, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_DEFAULT);
+    if (!copy) {
+        return false;
+    }
+    memcpy(copy, text, n);
+    req_t q = { copy, atomic_fetch_add(&s_gen, 1) + 1 };
+    drop_waiting();   /* one the task hasn't started is out of date */
+    if (xQueueSend(s_reqs, &q, 0) != pdTRUE) {
+        heap_caps_free(copy);
+        return false;
+    }
+    return true;
+}
+
+size_t muse_tts_take(uint8_t *out, size_t cap)
+{
+    if (!s_mp3 || !cap || atomic_load(&s_queued_gen) != atomic_load(&s_gen)) {
+        return 0;
+    }
+    return xStreamBufferReceive(s_mp3, out, cap, 0);
+}
+
+size_t muse_tts_pending(void)
+{
+    if (!s_mp3 || atomic_load(&s_queued_gen) != atomic_load(&s_gen)) {
+        return 0;
+    }
+    return xStreamBufferBytesAvailable(s_mp3);
+}
+
+muse_tts_state_t muse_tts_state(void)
+{
+    if (atomic_load(&s_result_gen) != atomic_load(&s_gen)) {
+        return MUSE_TTS_RUNNING;
+    }
+    return (muse_tts_state_t)atomic_load(&s_result);
 }
 
 void muse_tts_cancel(void)
 {
-    atomic_store(&s_tts_cancelled, true);
-    if (s_mp3_stream) {
-        xStreamBufferReset(s_mp3_stream);
+    if (!s_reqs) {
+        return;
     }
-    atomic_store(&s_server_done, true);
+    atomic_fetch_add(&s_gen, 1);
+    drop_waiting();
 }

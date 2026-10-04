@@ -1,49 +1,49 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Speech for Muse's replies: Volcengine's streaming TTS (豆包语音合成) on a
+ * task of its own. The MP3 is handed over as it arrives, so a reply starts
+ * speaking about a second after its text is complete.
+ *
+ * Used from one task (the Muse chat session's): begin a message, take its MP3
+ * as it comes, and watch the state for the end.
+ */
+
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#if CONFIG_MUSE_ENABLED
+typedef enum {
+    MUSE_TTS_RUNNING,   /* connecting, or speech still arriving */
+    MUSE_TTS_DONE,      /* all of it is queued (some may be left to take) */
+    MUSE_TTS_FAILED,    /* gave up; what did arrive is queued */
+} muse_tts_state_t;
 
-/**
- * @brief 异步启动火山引擎流式 TTS 请求 (豆包语音合成 2.0 unidirectional 接口)
- * @param text 待合成的文本
- * @return 启动成功返回 true，若未配置 API Key 或初始化失败返回 false
- */
-bool muse_tts_start(const char *text);
+/* An API key is set (CONFIG_MUSE_TTS_API_KEY); without one, replies stay text. */
+bool muse_tts_available(void);
 
-/**
- * @brief 从流式 TTS 接收缓冲区读取已解码就绪的 MP3 二进制数据块
- * @param out_mp3 目标缓冲区
- * @param max_len 最大读取字节数
- * @return 实际读取到的 MP3 字节数（若当前无数据返回 0）
- */
-size_t muse_tts_read_chunk(uint8_t *out_mp3, size_t max_len);
+/* Starts speaking text (UTF-8, Markdown allowed), cancelling any speech in progress.
+ * False if TTS isn't set up or memory ran out. */
+bool muse_tts_begin(const char *text);
 
-/**
- * @brief 查询流式 TTS 是否已经完整传输并消费完毕
- * @return true 表示整个音频流已全部接收完成且缓冲区已排空
- */
-bool muse_tts_is_finished(void);
+/* Takes up to cap bytes of the MP3 that has arrived. Never blocks. */
+size_t muse_tts_take(uint8_t *out, size_t cap);
 
-/**
- * @brief 中断/取消当前正在进行的 TTS 传输（释放网络连接和缓冲区）
- */
+/* Bytes of MP3 waiting to be taken. */
+size_t muse_tts_pending(void);
+
+/* The latest request's state. Read it before taking: once it says DONE or
+ * FAILED, everything that request will deliver is already waiting. */
+muse_tts_state_t muse_tts_state(void);
+
+/* Stops the latest request and drops what it queued. */
 void muse_tts_cancel(void);
-
-#else
-
-static inline bool muse_tts_start(const char *text) { (void)text; return false; }
-static inline size_t muse_tts_read_chunk(uint8_t *out_mp3, size_t max_len) { (void)out_mp3; (void)max_len; return 0; }
-static inline bool muse_tts_is_finished(void) { return true; }
-static inline void muse_tts_cancel(void) {}
-
-#endif
 
 #ifdef __cplusplus
 }

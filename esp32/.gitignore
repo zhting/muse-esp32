@@ -17,6 +17,8 @@ build/
 build-*/
 sdkconfig
 sdkconfig.old
+# Your own secrets (CONFIG_GADGET_SDK_TOKEN, CONFIG_MUSE_TTS_API_KEY).
+devices/sdkconfig.local
 managed_components/
 dependencies.lock
 .cache/

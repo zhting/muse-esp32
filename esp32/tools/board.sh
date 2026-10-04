@@ -108,6 +108,8 @@ fi
 
 BUILD_DIR="$PROJECT/build-$BOARD"
 cd "$PROJECT"
+# Your own secrets (SDK token, TTS API key), loaded last; .gitignore keeps it out of commits.
+[ -f devices/sdkconfig.local ] && DEFAULTS="$DEFAULTS;devices/sdkconfig.local"
 exec idf.py -B "$BUILD_DIR" \
   -DIDF_TARGET="$TARGET" \
   -DSDKCONFIG="$BUILD_DIR/sdkconfig" \

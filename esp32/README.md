@@ -220,11 +220,17 @@ things you can change:
 
 - **Shorter answers.** Ask for them in the message itself, such as "Answer in
   one sentence."
-- **Spoken answers.** Send each reply's text to a text-to-speech API of your
-  choice and play the audio it returns. On boards with PSRAM, `start_tts` in
-  [`components/muse/muse_chat_session.cpp`](components/muse/muse_chat_session.cpp)
-  is the spot: it has the reply text, and the MP3 decoder, speaker and volume
-  are already wired up there.
+- **Spoken answers.** On boards with PSRAM, set a Volcengine API key
+  (`CONFIG_MUSE_TTS_API_KEY`, under menuconfig > Muse > Speech) and each
+  reply is spoken with Volcengine's streaming TTS (豆包语音合成 2.0):
+  [`components/muse/muse_tts.c`](components/muse/muse_tts.c) streams the MP3
+  on a task of its own and the speaker starts with the first piece, about a
+  second after the reply's text is complete. Pick the voice, resource ID and
+  speech rate there too. Keep the key out of git: put it in your build
+  directory's `sdkconfig` or in `devices/sdkconfig.local` (see
+  `devices/sdkconfig.local.example`). Another TTS service plugs in at
+  `start_tts` in
+  [`components/muse/muse_chat_session.cpp`](components/muse/muse_chat_session.cpp).
 
 A few things worth knowing:
 

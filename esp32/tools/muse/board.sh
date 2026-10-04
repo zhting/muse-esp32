@@ -58,6 +58,8 @@ defaults="sdkconfig.defaults;devices/sdkconfig.muse;devices/sdkconfig.muse-$prof
 if [ -n "${MUSE_BENCH:-}" ]; then
     B=$B-bench; defaults="$defaults;devices/sdkconfig.muse-bench"
 fi
+# Your own secrets (SDK token, TTS API key), loaded last; .gitignore keeps it out of commits.
+[ -f devices/sdkconfig.local ] && defaults="$defaults;devices/sdkconfig.local"
 log=/tmp/muse_build_$board.log
 if [ "$cmd" = build ]; then
     # Boards share managed_components/ with each other and with the Link build,

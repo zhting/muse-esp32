@@ -26,8 +26,10 @@
  *   2. POST /chat/stream with the transcript. The reply arrives as events on
  *      the connection's long-lived POST /chat/subscribe stream: one or more
  *      assistant messages, each delta.message_start / text_append / message_done.
- *   3. Each finished message is shown at reading pace (see start_tts to
- *      speak it with a TTS API of your own; Muse doesn't speak gadget replies).
+ *   3. Each finished message is spoken: muse_tts.c streams it from
+ *      Volcengine's TTS on a task of its own, and its MP3 is played as it
+ *      arrives (Muse doesn't speak gadget replies itself). Without a TTS key,
+ *      or if the speech fails, it is shown at reading pace instead.
  * A turn has no explicit end event; like Sidekick, it settles once every
  * message is done and nothing has arrived for a few seconds.
  *
@@ -103,6 +105,8 @@ static const char *TAG = "muse_chat_session";
 #define SPEECH_CHARS_PER_S 14              /* until the speech's length is known */
 #define TEXT_CHARS_PER_S 16                /* speaker off: reading pace, a little over speech */
 #define TEXT_HOLD_S 2                      /* speaker off: how long a message's last lines stay up */
+#define TTS_PREBUF_BYTES 4096              /* MP3 in hand before a message starts playing (~0.5 s)... */
+#define TTS_PREBUF_US (300 * 1000LL)       /* ...or this long after its first bytes, so it doesn't stutter */
 
 #define PING_US (20 * 1000000LL)
 #define DEAD_US (60 * 1000000LL)           /* nothing from the server, pongs included */
@@ -240,6 +244,7 @@ struct turn_t {
     uint8_t *mp3;            /* MP3_BUF */
     size_t mp3_len;
     bool mp3_ended;
+    int64_t tts_first_us;    /* when tts_msg's first MP3 arrived, or 0 */
     mp3dec_t dec;
     resampler_t down;
     int kbps;
@@ -952,8 +957,8 @@ static void turn_reset_streams(void)
 
 static void turn_finish(void)
 {
-    muse_tts_cancel();
     turn_reset_streams();
+    muse_tts_cancel();
     s_turn.phase = P_IDLE;
     s_turn.dict_id = s_turn.chat_id = 0;
     s_turn.tts_msg = -1;
@@ -1505,27 +1510,16 @@ static void start_tts(void)
             continue;
         }
 
-        /* 扬声器静音或关闭时：不请求网络 TTS，直接显示字幕并按阅读速度推进 */
-        int vol = muse_settings_volume();
-        if (vol <= 0) {
-            m.pcm_start = s_turn.pcm_out;
-            m.pcm_frames = (uint32_t)(m.len * MIC_RATE / TEXT_CHARS_PER_S);
-            m.tts = TTS_ACTIVE;
-            s_turn.tts_msg = i;
-            s_turn.silent = true;
-            ESP_LOGI(TAG, "showing message %s (%u chars, speaker silent)", m.id, (unsigned)m.len);
-            show_reply_start(m);
-            return;
-        }
-
+        /*
+         * Speak it: muse_tts streams the MP3 from its own task, pump_tts()
+         * moves it into s_turn.mp3 as it arrives, and decode() plays it at the
+         * speaker's volume, captions following, finishing the message once
+         * it's drained. Nothing here waits for the speech. With the speaker
+         * off, nothing is fetched: it's shown at reading pace below.
+         */
         const char *text = s_turn.texts ? (s_turn.texts + i * TEXT_MAX) : nullptr;
-        bool started = false;
-        if (text && text[0]) {
-            ESP_LOGI(TAG, "Starting streaming Volcengine TTS 2.0 for msg %s: %s", m.id, text);
-            started = muse_tts_start(text);
-        }
-
-        if (started) {
+        if (text && text[0] && muse_settings_speaker_on() && muse_tts_begin(text)) {
+            mark(M_TTS);
             m.tts = TTS_ACTIVE;
             s_turn.tts_msg = i;
             s_turn.silent = false;
@@ -1533,24 +1527,66 @@ static void start_tts(void)
             m.pcm_frames = 0;
             s_turn.mp3_len = 0;
             s_turn.mp3_ended = false;
+            s_turn.tts_first_us = 0;
             s_turn.kbps = 0;
             s_turn.down_rate = 0;
             mp3dec_init(&s_turn.dec);
-            s_conn.last_rx_us = now_us();
+            ESP_LOGI(TAG, "speaking message %s (%u bytes)", m.id, (unsigned)m.len);
             show_reply_start(m);
             return;
         }
 
-        /* Fallback: Replies are text, shown at reading pace if TTS is unavailable */
+        /* No TTS: the reply is shown at reading pace, silence pacing the captions. */
         m.pcm_start = s_turn.pcm_out;
         m.pcm_frames = (uint32_t)(m.len * MIC_RATE / TEXT_CHARS_PER_S);
         m.tts = TTS_ACTIVE;
         s_turn.tts_msg = i;
         s_turn.silent = true;
-        ESP_LOGI(TAG, "showing message %s (%u chars, silent fallback)", m.id, (unsigned)m.len);
+        ESP_LOGI(TAG, "showing message %s (%u chars)", m.id, (unsigned)m.len);
         show_reply_start(m);
         return;
     }
+}
+
+/*
+ * Moves the speech's MP3 from the TTS task into s_turn.mp3 as it arrives and
+ * notices its end. It stops short of the room poll_socket() keeps for the VM's
+ * own streams, so a long reply never holds up the connection; the rest waits
+ * in the TTS task's queue, and behind that in TCP.
+ */
+static void pump_tts(void)
+{
+    if (s_turn.tts_msg < 0 || s_turn.silent || s_turn.mp3_ended) {
+        return;
+    }
+    muse_tts_state_t st = muse_tts_state();   /* first: once it's over, all of it is queued */
+    const size_t limit = MP3_BUF - MP3_POLL_ROOM;
+    bool got = false;
+    while (s_turn.mp3_len < limit) {
+        size_t n = muse_tts_take(s_turn.mp3 + s_turn.mp3_len, limit - s_turn.mp3_len);
+        if (!n) {
+            break;
+        }
+        s_turn.mp3_len += n;
+        got = true;
+    }
+    if (got && !s_turn.tts_first_us) {
+        mark(M_MP3);
+        s_turn.tts_first_us = now_us();
+    }
+    if (st == MUSE_TTS_RUNNING || muse_tts_pending()) {
+        return;
+    }
+    msg_t &m = s_turn.msgs[s_turn.tts_msg];
+    if (st == MUSE_TTS_FAILED && !s_turn.tts_first_us) {
+        /* Nothing to say after all: show it at reading pace instead. */
+        ESP_LOGW(TAG, "no speech for message %s, showing it", m.id);
+        m.pcm_start = s_turn.pcm_out;
+        m.pcm_frames = (uint32_t)(m.len * MIC_RATE / TEXT_CHARS_PER_S);
+        s_turn.silent = true;
+        return;
+    }
+    s_turn.mp3_ended = true;   /* decode() plays the rest, then finishes the message */
 }
 
 static void tts_data(const uint8_t *data, size_t len)
@@ -1606,6 +1642,11 @@ static void decode(void)
     if (s_turn.silent) {
         pace_silently();
         return;
+    }
+    const msg_t &cur = s_turn.msgs[s_turn.tts_msg];
+    if (!s_turn.mp3_ended && s_turn.pcm_out == cur.pcm_start && s_turn.mp3_len < TTS_PREBUF_BYTES &&
+        (!s_turn.tts_first_us || now_us() - s_turn.tts_first_us < TTS_PREBUF_US)) {
+        return;   /* a little speech in hand first, so the start doesn't stutter */
     }
     /*
      * minimp3 only takes a frame once it can see the next one's header. Given
@@ -2001,20 +2042,7 @@ static void hatch_task(void *arg)
         }
         if (s_turn.phase == P_WAIT_REPLY) {
             start_tts();
-            if (s_turn.tts_msg >= 0 && !s_turn.silent) {
-                uint8_t chunk[2048];
-                size_t n;
-                while ((n = muse_tts_read_chunk(chunk, sizeof(chunk))) > 0) {
-                    tts_data(chunk, n);
-                    s_conn.last_rx_us = now_us();
-                    if (s_turn.mp3_len >= MP3_BUF - sizeof(chunk)) {
-                        break;
-                    }
-                }
-                if (muse_tts_is_finished()) {
-                    s_turn.mp3_ended = true;
-                }
-            }
+            pump_tts();
             decode();
         }
         if (!s_connected) {

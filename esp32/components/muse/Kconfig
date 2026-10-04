@@ -168,17 +168,58 @@ menu "Muse"
         help
             Push-to-talk turns go over a voice session of Muse's own, to the
             VM Home Link is paired with or one set up on the device with a
-            device token. Replies are text, shown as captions; start_tts in
-            muse_chat_session.cpp is where a TTS API of your own can speak
-            them. Needs PSRAM. Without it, voice notes go over Home Link's own
-            session to its paired VM and replies are shown as text.
+            device token. Replies come as text, shown as captions, and are
+            spoken with Volcengine's TTS when it has an API key (Speech,
+            below). Needs PSRAM. Without it, voice notes go over Home Link's
+            own session to its paired VM and replies are shown as text.
 
-    config VOLC_TTS_API_KEY
-        string "Volcengine DoubaoVoice TTS API Key"
-        depends on MUSE_ENABLED
-        default ""
-        help
-            API key for ByteDance Volcengine DoubaoVoice TTS (seed-audio-1.0).
-            Can be configured via menuconfig or left empty.
+    menu "Speech (Volcengine TTS)"
+        depends on MUSE_HATCH || HOMEHUB_VOICE
+
+        config MUSE_TTS_API_KEY
+            string "API key"
+            default ""
+            help
+                A Volcengine API key (火山引擎 console, new-style API Key)
+                with the resource below enabled. Empty: replies are shown,
+                not spoken.
+
+                Keep it out of git. Set it in your build directory's
+                sdkconfig (idf.py -B <build dir> menuconfig), or in a
+                devices/sdkconfig.local loaded after the board's overlay,
+                which .gitignore keeps out of commits.
+
+        config MUSE_TTS_RESOURCE_ID
+            string "Resource ID"
+            default "seed-tts-2.0"
+            help
+                X-Api-Resource-Id: seed-tts-2.0 for the 2.0 voices
+                (*_uranus_bigtts), seed-tts-1.0 for 1.0 voices (*_moon_bigtts,
+                *_mars_bigtts), seed-icl-2.0 for a cloned voice (S_...).
+
+        config MUSE_TTS_SPEAKER
+            string "Voice"
+            default "zh_female_wenrouxiaoya_uranus_bigtts"
+            help
+                The voice (speaker) ID from Volcengine's voice list. The
+                default is 温柔小雅 2.0; zh_female_vv_uranus_bigtts (Vivi 2.0)
+                and zh_female_xiaohe_uranus_bigtts (小荷 2.0) are multilingual.
+                It must match the resource ID.
+
+        config MUSE_TTS_SPEECH_RATE
+            int "Speech rate"
+            range -50 100
+            default 0
+            help
+                -50 is half speed, 0 normal, 100 double speed.
+
+        config MUSE_TTS_STYLE
+            string "Speaking instruction (2.0 voices)"
+            default ""
+            help
+                Optional context_texts instruction for 2.0 voices, such as
+                温柔地说话. Empty sends none.
+
+    endmenu
 
 endmenu

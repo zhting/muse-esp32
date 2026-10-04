@@ -1,0 +1,14 @@
+# Copy to devices/sdkconfig.local and fill in. .gitignore keeps that file out
+# of commits; tools/board.sh and tools/muse/board.sh load it after the board's
+# overlay. Building with idf.py directly, add it to the end of
+# SDKCONFIG_DEFAULTS (one line):
+#   idf.py -B build-muse-espressif-vocat -DIDF_TARGET=esp32s3 -DSDKCONFIG=build-muse-espressif-vocat/sdkconfig -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;devices/sdkconfig.muse;devices/sdkconfig.muse-espressif-vocat;devices/sdkconfig.local" build
+# Defaults are read only when a build directory's sdkconfig is created: in an
+# existing build directory, change these with menuconfig instead.
+
+# gadgets.muse.ai > Account > SDK tokens
+CONFIG_GADGET_SDK_TOKEN="mgst_..."
+
+# Volcengine console (豆包语音) > API Key, with 豆包语音合成模型2.0 enabled.
+# Leave empty to show replies without speaking them.
+CONFIG_MUSE_TTS_API_KEY=""
